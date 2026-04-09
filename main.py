@@ -12,7 +12,7 @@ CORS(app)
 # In-memory DB: { id: { keypoints: [...], descriptors: np.array } }
 image_database = {}
 
-orb = cv2.ORB_create(nFeatures=1000)
+orb = cv2.ORB_create(nfeatures=1000)
 bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
 def decode_image(b64_string):
