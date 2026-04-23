@@ -1,163 +1,254 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import os
 import cv2
 import numpy as np
-import base64
+import pickle
+import uuid
+import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from supabase import create_client, Client
 import json
-import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-image_database = {}
+# ── Supabase (free tier — handles image storage + DB) ──────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-orb = cv2.ORB_create(nfeatures=1000)
-bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+# ── ORB config — grid-based for partial view tracking ─────────────────────────
+ORB = cv2.ORB_create(
+    nfeatures=800,
+    scaleFactor=1.2,
+    nlevels=8,
+    edgeThreshold=15,
+    patchSize=31
+)
 
-DB_PATH = 'image_db.json'
-
-
-def decode_image(b64_string):
-    try:
-        img_bytes = base64.b64decode(b64_string)
-        arr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-        return img
-    except Exception:
-        return None
-
-
-def extract_features(img):
-    if img is None:
-        return [], None
-    keypoints, descriptors = orb.detectAndCompute(img, None)
-    return keypoints or [], descriptors
+FLANN_INDEX_LSH = 6
+INDEX_PARAMS = dict(algorithm=FLANN_INDEX_LSH, table_number=12, key_size=20, multi_probe_level=2)
+FLANN = cv2.FlannBasedMatcher(INDEX_PARAMS, {})
 
 
-def match_score(desc1, desc2):
-    if desc1 is None or desc2 is None:
-        return 0
+def extract_grid_descriptors(image_bgr, grid=4):
+    """
+    Extract ORB descriptors from a 4x4 grid to ensure
+    keypoints across the whole image — enables partial view matching.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    cell_h, cell_w = h // grid, w // grid
 
-    matches = bf.match(desc1, desc2)
-    if not matches:
-        return 0
+    all_kp = []
+    all_desc = []
 
-    good = [m for m in matches if m.distance < 50]
-    return len(good)
+    for row in range(grid):
+        for col in range(grid):
+            y1, y2 = row * cell_h, (row + 1) * cell_h
+            x1, x2 = col * cell_w, (col + 1) * cell_w
+            cell = gray[y1:y2, x1:x2]
 
+            kp, desc = ORB.detectAndCompute(cell, None)
+            if desc is None or len(kp) == 0:
+                continue
 
-def save_database():
-    serializable = {}
-    for image_id, entry in image_database.items():
-        serializable[image_id] = {
-            'descriptors': entry['descriptors'].tolist()
-        }
+            # Offset keypoints to full-image coordinates
+            for k in kp:
+                k.pt = (k.pt[0] + x1, k.pt[1] + y1)
 
-    with open(DB_PATH, 'w') as f:
-        json.dump(serializable, f)
+            all_kp.extend(kp)
+            all_desc.append(desc)
 
+    if not all_desc:
+        return None, None
 
-def load_database():
-    if not os.path.exists(DB_PATH):
-        return
-
-    with open(DB_PATH, 'r') as f:
-        raw = json.load(f)
-
-    for image_id, entry in raw.items():
-        image_database[image_id] = {
-            'descriptors': np.array(entry['descriptors'], dtype=np.uint8)
-        }
-
-    print(f"Loaded {len(image_database)} images from DB")
+    stacked = np.vstack(all_desc)
+    return all_kp, stacked
 
 
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({
-        'status': 'ok',
-        'images': len(image_database)
-    })
+def rebuild_flann_index():
+    """
+    Rebuild FLANN index from all descriptors in DB.
+    Called after every new image upload.
+    Returns serialized index bytes.
+    """
+    response = supabase.table("artworks").select("id, descriptors").execute()
+    rows = response.data
 
+    if not rows:
+        return None, []
 
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.get_json(silent=True) or {}
+    all_desc = []
+    id_map = []  # parallel array: descriptor_row_index → artwork_id
 
-    img_id = data.get('id')
-    b64_image = data.get('imageBase64')
+    for row in rows:
+        desc_list = json.loads(row["descriptors"])
+        desc_array = np.array(desc_list, dtype=np.uint8)
+        all_desc.append(desc_array)
+        id_map.extend([row["id"]] * len(desc_array))
 
-    if not img_id:
-        return jsonify({'success': False, 'reason': 'missing_id'}), 400
+    stacked = np.vstack(all_desc)
 
-    if not b64_image:
-        return jsonify({'success': False, 'reason': 'missing_image'}), 400
+    flann = cv2.FlannBasedMatcher(INDEX_PARAMS, {})
+    flann.add([stacked])
+    flann.train()
 
-    img = decode_image(b64_image)
-    if img is None:
-        return jsonify({'success': False, 'reason': 'invalid_image'}), 400
-
-    kp, desc = extract_features(img)
-    if desc is None or len(kp) < 10:
-        return jsonify({'success': False, 'reason': 'not_enough_features'}), 400
-
-    image_database[img_id] = {
-        'descriptors': desc
+    index_data = {
+        "id_map": id_map,
+        "descriptors": stacked.tolist()
     }
 
-    save_database()
+    return index_data, id_map
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()})
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload_artwork():
+    """
+    Receives: multipart form with 'image' file + optional 'video_url' field
+    1. Uploads image to Supabase Storage (public bucket)
+    2. Extracts ORB descriptors (grid-based)
+    3. Saves to artworks table
+    4. Returns artwork id + public image url
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+
+    image_file = request.files["image"]
+    video_url  = request.form.get("video_url", "")
+    title      = request.form.get("title", "Untitled")
+
+    # Read image bytes
+    img_bytes = image_file.read()
+    np_arr    = np.frombuffer(img_bytes, np.uint8)
+    img_bgr   = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if img_bgr is None:
+        return jsonify({"error": "Invalid image"}), 400
+
+    # Extract grid-based ORB descriptors
+    _, descriptors = extract_grid_descriptors(img_bgr)
+    if descriptors is None:
+        return jsonify({"error": "Could not extract features from image"}), 400
+
+    # Upload image to Supabase Storage
+    artwork_id  = str(uuid.uuid4())
+    file_ext    = image_file.filename.rsplit(".", 1)[-1].lower() if "." in image_file.filename else "jpg"
+    storage_path = f"artworks/{artwork_id}.{file_ext}"
+
+    supabase.storage.from_("ar-images").upload(
+        path=storage_path,
+        file=img_bytes,
+        file_options={"content-type": image_file.content_type or "image/jpeg"}
+    )
+
+    # Get public URL
+    public_url = supabase.storage.from_("ar-images").get_public_url(storage_path)
+
+    # Estimate physical width (default 0.3m — can be overridden)
+    physical_width = float(request.form.get("physical_width", 0.3))
+
+    # Save to DB
+    supabase.table("artworks").insert({
+        "id":             artwork_id,
+        "title":          title,
+        "image_url":      public_url,
+        "video_url":      video_url,
+        "physical_width": physical_width,
+        "descriptors":    json.dumps(descriptors.tolist()),
+        "created_at":     datetime.utcnow().isoformat()
+    }).execute()
 
     return jsonify({
-        'success': True,
-        'keypoints': len(kp),
-        'total': len(image_database)
+        "success":   True,
+        "id":        artwork_id,
+        "image_url": public_url,
+        "message":   f"Extracted {len(descriptors)} descriptors"
     })
 
 
-@app.route('/api/identify', methods=['POST'])
-def identify():
-    data = request.get_json(silent=True) or {}
-    b64_frame = data.get('imageBase64')
+@app.route("/api/descriptors", methods=["GET"])
+def get_descriptors():
+    """
+    Returns the full FLANN-ready descriptor bundle.
+    Unity downloads this once at app startup (~5MB for 1000 images).
+    Format: { id_map: [...], descriptors: [[...], ...] }
+    """
+    index_data, _ = rebuild_flann_index()
 
-    if not b64_frame:
-        return jsonify({'matched': False, 'reason': 'missing_image'}), 400
+    if index_data is None:
+        return jsonify({"id_map": [], "descriptors": []})
 
-    img = decode_image(b64_frame)
-    if img is None:
-        return jsonify({'matched': False, 'reason': 'invalid_image'}), 400
+    return jsonify(index_data)
 
-    _, query_desc = extract_features(img)
-    if query_desc is None:
-        return jsonify({'matched': False, 'reason': 'no_features_detected'}), 200
 
-    best_id = None
-    best_score = 0
-    min_good_matches = 15
+@app.route("/api/manifest", methods=["GET"])
+def get_manifest():
+    """
+    Returns lightweight metadata for all artworks.
+    No heavy data — just ids, physical sizes, video urls.
+    Unity uses this to know physicalWidth for AddReferenceImage.
+    """
+    response = supabase.table("artworks") \
+        .select("id, title, physical_width, video_url") \
+        .execute()
 
-    for img_id, entry in image_database.items():
-        stored_desc = np.array(entry['descriptors'], dtype=np.uint8)
-        score = match_score(query_desc, stored_desc)
+    artworks = [
+        {
+            "id":             row["id"],
+            "title":          row["title"],
+            "physicalWidth":  row["physical_width"],
+            "videoUrl":       row["video_url"]
+        }
+        for row in response.data
+    ]
 
-        if score > best_score:
-            best_score = score
-            best_id = img_id
+    return jsonify({"artworks": artworks})
 
-    if best_id and best_score >= min_good_matches:
-        return jsonify({
-            'matched': True,
-            'imageId': best_id,
-            'score': best_score
-        })
 
+@app.route("/api/artwork/<artwork_id>", methods=["GET"])
+def get_artwork(artwork_id):
+    """
+    Called after FLANN match confirmed on device.
+    Returns only the video URL — no heavy data.
+    """
+    response = supabase.table("artworks") \
+        .select("id, title, video_url, physical_width") \
+        .eq("id", artwork_id) \
+        .single() \
+        .execute()
+
+    if not response.data:
+        return jsonify({"error": "Not found"}), 404
+
+    row = response.data
     return jsonify({
-        'matched': False,
-        'reason': 'no_match',
-        'bestScore': best_score
+        "id":            row["id"],
+        "title":         row["title"],
+        "videoUrl":      row["video_url"],
+        "physicalWidth": row["physical_width"]
     })
 
 
-load_database()
+@app.route("/api/artworks", methods=["GET"])
+def list_artworks():
+    """Admin endpoint — list all artworks with full details."""
+    response = supabase.table("artworks") \
+        .select("id, title, image_url, video_url, physical_width, created_at") \
+        .order("created_at", desc=True) \
+        .execute()
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 3000))
-    app.run(host='0.0.0.0', port=port)
+    return jsonify({"artworks": response.data})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
